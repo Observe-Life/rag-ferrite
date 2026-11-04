@@ -24,12 +24,14 @@
 
 构建产物是 `FROM scratch` + 一个静态二进制，没有 libc 依赖：`rusqlite` 用 `bundled`（SQLite 源码编进二进制）、`sqlite-vec` 静态链接、TLS 根证书由 `webpki-roots` 内嵌，所以镜像里不需要 `/etc/ssl`。
 
-### 四条必须知道的构建约束
+### 五条必须知道的构建约束
 
-1. **镜像标签必须带 `ghcr.io/` 前缀**。漏掉前缀 buildx 会当成 Docker Hub 处理，拿 GitHub 令牌去 `auth.docker.io` 认证，报 `401 insufficient scopes`——看起来像权限问题，实际是笔误。工作流里已加自检，标签不含前缀直接失败。
-2. **musl 需要显式指定交叉编译器**。`CC_x86_64_unknown_linux_musl=musl-gcc`，因为 `rusqlite` 的 bundled 与 `sqlite-vec` 都要编 C。
-3. **Actions 自己推送的提交不会再触发工作流**（GitHub 防递归）。所以 `fmt.yml` 提交的格式化结果需要**补一个空提交**才能进 CI。
-4. **GitHub 事故期间状态字段会滞后**。同一 job 可能同时显示 `completed/failure` 和 `queued/in progress`，日志也读不到。判断构建是否成功，**用拉取镜像比对 digest，不要信 `run list`**：
+1. **镜像构建只认手动触发和 `v*` 标签**。`build-musl.yml` 的触发器是 `workflow_dispatch` + `push:tags:v*`，普通 push 到 main 不会构建镜像；历次运行 `event` 均为 `workflow_dispatch` 可佐证。而 `ci.yml`（Rust quality gates）对每次 push 到 main 都跑，已配置 `paths-ignore` 排除 `**.md`、`docs/**`、`LICENSE`、`.gitignore`，但**不排除** `.github/workflows/**`——改 CI 配置本身必须被验证。
+
+2. **镜像标签必须带 `ghcr.io/` 前缀**。漏掉前缀 buildx 会当成 Docker Hub 处理，拿 GitHub 令牌去 `auth.docker.io` 认证，报 `401 insufficient scopes`——看起来像权限问题，实际是笔误。工作流里已加自检，标签不含前缀直接失败。
+3. **musl 需要显式指定交叉编译器**。`CC_x86_64_unknown_linux_musl=musl-gcc`，因为 `rusqlite` 的 bundled 与 `sqlite-vec` 都要编 C。
+4. **Actions 自己推送的提交不会再触发工作流**（GitHub 防递归）。所以 `fmt.yml` 提交的格式化结果需要**补一个空提交**才能进 CI。
+5. **GitHub 事故期间状态字段会滞后**。同一 job 可能同时显示 `completed/failure` 和 `queued/in progress`，日志也读不到。判断构建是否成功，**用拉取镜像比对 digest，不要信 `run list`**：
 
    ```bash
    OLD=$(docker inspect --format '{{.Id}}' ghcr.io/observe-life/rag-ferrite:canary)
