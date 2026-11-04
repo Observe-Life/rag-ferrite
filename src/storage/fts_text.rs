@@ -164,7 +164,11 @@ pub fn index_text(text: &str) -> String {
                         terms.push(format!("{}{}", seg.text, c));
                     }
                     if nxt.len() >= 2 {
-                        terms.push(format!("{}{}", seg.text, nxt[..2].iter().collect::<String>()));
+                        terms.push(format!(
+                            "{}{}",
+                            seg.text,
+                            nxt[..2].iter().collect::<String>()
+                        ));
                     }
                 }
                 (Class::Ideograph, Class::Word) => {
@@ -192,7 +196,10 @@ mod tests {
     use super::*;
 
     fn terms(text: &str) -> Vec<String> {
-        index_text(text).split(' ').filter(|s| !s.is_empty()).collect()
+        index_text(text)
+            .split(' ')
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     #[test]
@@ -236,7 +243,10 @@ mod tests {
 
     #[test]
     fn case_is_normalized() {
-        assert_eq!(terms("CLIPPY.TOML").contains(&"clippy.toml".to_owned()), true);
+        assert_eq!(
+            terms("CLIPPY.TOML").contains(&"clippy.toml".to_owned()),
+            true
+        );
     }
 
     #[test]
@@ -244,7 +254,10 @@ mod tests {
         // 查询词必须能在包含它的文档切法中找到，否则检索会静默失效
         let doc = terms("我对海鲜过敏，尤其是虾蟹");
         for query_term in terms("虾蟹") {
-            assert!(doc.contains(&query_term), "查询词元 {query_term:?} 不在文档切法中");
+            assert!(
+                doc.contains(&query_term),
+                "查询词元 {query_term:?} 不在文档切法中"
+            );
         }
     }
 }

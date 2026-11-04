@@ -353,9 +353,8 @@ fn rebuild_fts_index_with_conn(conn: &rusqlite::Connection) -> Result<()> {
     // 切词是 Rust 函数，无法在 INSERT ... SELECT 里调用，因此逐行取出正文、
     // 切词后再写入索引。正文原文仍保留在 chunks 表，供展示与重排使用。
     let rows: Vec<(String, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT content, id FROM chunks WHERE embedding IS NOT NULL",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT content, id FROM chunks WHERE embedding IS NOT NULL")?;
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -571,11 +570,14 @@ fn search_bm25_with_allowed_ids(
              ORDER BY score
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(rusqlite::params![match_expr, candidate_limit as i64], |row| {
-            let id: i64 = row.get(0)?;
-            let score: f64 = row.get(1)?;
-            Ok((id, -score))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![match_expr, candidate_limit as i64],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let score: f64 = row.get(1)?;
+                Ok((id, -score))
+            },
+        )?;
         let raw: Vec<(i64, f64)> = rows.collect::<rusqlite::Result<_>>()?;
         let result: Vec<(i64, f64)> = raw
             .iter()
