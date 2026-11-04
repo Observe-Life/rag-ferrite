@@ -199,6 +199,7 @@ mod tests {
         index_text(text)
             .split(' ')
             .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
             .collect()
     }
 
