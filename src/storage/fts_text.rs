@@ -244,10 +244,7 @@ mod tests {
 
     #[test]
     fn case_is_normalized() {
-        assert_eq!(
-            terms("CLIPPY.TOML").contains(&"clippy.toml".to_owned()),
-            true
-        );
+        assert!(terms("CLIPPY.TOML").contains(&"clippy.toml".to_owned()));
     }
 
     #[test]
