@@ -446,7 +446,16 @@ async fn background_worker(
                     ),
                 )
                 .await;
-                rebuild_indexes_serialized().await;
+                // 单篇任务不无条件全量重建。全文索引行在提交每个块时已由
+                // add_chunk_to_indexes 增量写入（storage/sqlite.rs:101），删除文档时由
+                // delete_source 同步清理 chunks_fts/chunks_vec/chunk_tags（:196-200），
+                // 实测增量结果与全量重建一致（FTS 行数差异 0），故重建对单篇任务是纯重复。
+                // 此前队列层无条件重建，绕过了引擎层的 defer_index_rebuild 开关（默认 true），
+                // 使逐篇导入的累计成本变成 O(n²)，且每次重建都持有全局单连接锁、阻塞全部 API。
+                // Batch 分支保留一次 flush，与 flush_indexes() 注释声明的意图一致。
+                if !ingest_config.defer_index_rebuild {
+                    rebuild_indexes_serialized().await;
+                }
             }
             IngestJob::Data { content, source } => {
                 run_with_timeout(
@@ -462,7 +471,10 @@ async fn background_worker(
                     ),
                 )
                 .await;
-                rebuild_indexes_serialized().await;
+                // 同上：逐条数据任务不无条件全量重建，尊重 defer_index_rebuild。
+                if !ingest_config.defer_index_rebuild {
+                    rebuild_indexes_serialized().await;
+                }
             }
             IngestJob::Batch {
                 batch_id,

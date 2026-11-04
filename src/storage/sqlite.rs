@@ -834,6 +834,67 @@ fn get_filtered_chunk_ids_with_conn(
 mod tests {
     use super::*;
 
+    /// 回归锁：入库时 FTS 行由 add_chunk_to_indexes 增量写入，队列层不再对每个
+    /// 单篇任务无条件全量重建（那是 O(n²) 的来源）。本测试证明「增量写入的结果」
+    /// 与「全量重建后的结果」行数与命中完全一致，因此跳过重建不会让关键词索引缺行。
+    /// 一旦增量写入被破坏（例如某条入库路径忘了写 chunks_fts），本测试立即转红。
+    #[test]
+    fn incremental_fts_rows_equal_a_full_rebuild() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY, source_id INTEGER,
+                content TEXT NOT NULL, embedding BLOB
+             );
+             CREATE VIRTUAL TABLE chunks_fts USING fts5(content, chunk_id UNINDEXED);",
+        )
+        .unwrap();
+
+        let docs: [(i64, &str); 3] = [
+            (1, "本机素材库从 weknora 换成 rag-ferrite"),
+            (2, "章若楠 1998 年出生于浙江省温州市"),
+            (3, "celld 四大铁律里无锁核心最硬"),
+        ];
+        for (id, text) in &docs {
+            conn.execute(
+                "INSERT INTO chunks (id, source_id, content, embedding)
+                 VALUES (?1, ?1, ?2, x'01020304')",
+                rusqlite::params![id, text],
+            )
+            .unwrap();
+            // 与 add_chunk_to_indexes 完全相同的增量写入表达式
+            conn.execute(
+                "INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)",
+                rusqlite::params![index_text(text), id],
+            )
+            .unwrap();
+        }
+
+        let rows = || -> i64 {
+            conn.query_row("SELECT count(*) FROM chunks_fts", [], |r| r.get(0))
+                .unwrap()
+        };
+        let hit = |q: &str| -> Vec<i64> {
+            let expr = fts5_match_expression(q);
+            let mut stmt = conn
+                .prepare("SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY rank")
+                .unwrap();
+            stmt.query_map([expr], |r| r.get(0))
+                .unwrap()
+                .filter_map(|x| x.ok())
+                .collect()
+        };
+
+        let rows_before = rows();
+        let hit_before = hit("章若楠");
+        assert_eq!(hit_before, vec![2], "增量写入后 BM25 应能命中该块");
+
+        rebuild_fts_index_with_conn(&conn).unwrap();
+
+        assert_eq!(rows_before, rows(), "全量重建改变了 FTS 行数 → 增量写入有遗漏");
+        assert_eq!(hit_before, hit("章若楠"), "全量重建改变了命中 → 增量与全量不等价");
+    }
+
     #[test]
     fn fts5_match_expression_ors_quoted_tokenized_terms() {
         // 词元逐个加引号，避免 . / 被 FTS5 当作操作符（修复前这类查询直接 500）
