@@ -138,7 +138,7 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 
 ---
 
-## 本仓库相对上游的五项改动
+## 本仓库相对上游的七项改动
 
 | 提交 | 内容 | 为什么 |
 |---|---|---|
@@ -147,28 +147,41 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 | `fd71320` | **中文切词**（`src/storage/fts_text.rs`） | FTS5 的 `unicode61` 把连续汉字当成一个词，中文关键词检索必然落空。规则：汉字段出单字+相邻双字；ASCII 段整词小写并保留 `- _ . / +`；中英紧邻补跨界词；标点断开。索引侧与查询侧共用同一函数 |
 | `4359a2d` | `default_log_filter()` 由 `rag_ferrite=debug` 改为 `info` | crate 真名是 `ragfer`，名字不匹配导致所有日志被过滤，容器表现为毫无输出 |
 | `bc80ba8` | 消除**入库路径**的嵌套取锁死锁 | `commit_parent_to_db` 的 guard 作用域直到函数末尾，而标签分支里又二次 `get_conn()`。该分支只在上下文增强产出 TAGS 时进入，因此关闭 `context_enabled` 时永不触发——这是它长期未被发现的原因。实测开启后入库 100% 卡死：18 线程全停在 `futex_wait`、无一停在 `epoll_wait`、无对外连接 |
+| `4137990` | 队列层不再对**单篇任务**无条件全量重建索引 | `ingestion.rs` 的 `IngestJob::File`/`Data` 分支在每个任务后都调 `rebuild_indexes_serialized()`，**完全绕过 `defer_index_rebuild`（默认已是 `true`）**。于是每篇一次全库重建，逐篇导入累计成本 O(n²)，且重建持有全局单连接锁、期间所有 API 无响应。改为尊重该配置；`Batch` 分支与显式 flush 保留（那才是 `flush_indexes()` 注释声明的意图） |
+| `32aac94` | 索引重建整体包进**一个事务** | 逐行 `stmt.execute()` 在 WAL 下每行一个隐式事务，而 FTS5 每次插入都要更新倒排 b-tree 并 segment merge，成本随索引规模上升——实测 2724 行重建约 660 秒。事务化后 5652 行只用 5.0 秒。同一事务还保证 DELETE 与重插原子：此前进程被杀会留下「索引已清空大半」的残缺状态且重启不自愈 |
 
 切词只作用于全文索引表 `chunks_fts`；`chunks.content` 保持原文，因此重排模型和大模型读到的仍是干净文本。代价是 OR 连接使召回变宽，精度依赖 `bm25()` 打分、RRF 与重排收敛。
 
 ---
 
-## 实测基线（10 篇 / 376 块）
+## 实测基线（80 篇 / 6549 块）
 
 | 指标 | 数值 |
 |---|---|
-| 常驻内存 | 2.6–3.6 MiB（随运行时长浮动，CPU 0%） |
-| 库文件 | 8.6 MB + WAL 0.9 MB |
-| 单查询耗时 | 0.17–0.79 秒 |
-| Hit@3 | 13/13 |
-| Hit@1 | 无重排 12/13；有重排 11/13 |
+| 常驻内存 | **4.3 MiB**（CPU 0%，导入中峰值 5.4 MiB） |
+| 库文件 | 90 MB |
+| 单查询耗时 | 0.21–0.50 秒（含重排） |
+| 批量导入 | 40 篇 / 1596 块 / **63 秒** / 0 错误（约 1.6 秒/篇） |
+| 全量索引重建 | 5652 行 **5.0 秒**（事务化前 2724 行约 660 秒） |
+| 索引一致性 | 应索引 5652 = `chunks_fts` 5652，缺 0、孤儿 0 |
 
-失败集中在**主题相近的文档互相混淆**（如《MSP简介》与《MSP前景分析》）。核查后修正：两篇各自都含定义式表述，属文档内容本身交叉，不是索引能区分的问题，该条不应判错。
+### 入库必须用批量端点，不要用逐篇 `/api/ingest/data`
 
-**上下文增强（`llm.context_enabled`）已实测否决，保持关闭。**
+`/api/ingest` 接受 `{"paths":[...]}`，走 `IngestJob::Batch`，**整批只做一次索引 flush**；
+而逐篇 `/api/ingest/data` 每篇都会触发一次 flush。文件须位于 `allowed_ingest_roots`
+（本机为 `/data/library`）之下。内容按 SHA-256 判重，重复提交会被跳过（回执里
+`0 chunks`），所以重跑同一批是安全的。
+
+### 返回条数受 `reranker.top_k` 截断
+
+`top_k = 10` 时，即使请求 `limit=20` 也只返回 10 条。要拿更多重排结果，
+必须同时调大 `reranker.top_k`，不能只调 `limit`。
+
+### 上下文增强（`llm.context_enabled`）已实测否决，保持关闭
 
 | 层面 | 关闭 | 开启 |
 |---|---|---|
-| 文档级 Hit@1 | 12/13 | 12/13（名次零变化，失败点相同） |
+| 文档级 Hit@1（13 条查询） | 12/13 | 12/13（名次零变化，失败点相同） |
 | 块级 MRR（10 条 gold，宽松口径） | **0.867** | 0.803 |
 
 机制：上下文前缀对同一文档的所有块近似，把组内相似度从 0.4801 抬到 0.5091，代价是**抹平块与块的差异**——精确细节类查询里正确块的绝对相似度反而下降（0.5436→0.4746），与相邻块的差距从 0.048 缩到 0.001。检索最终按块返回，故净效果为负。它优化的是"哪篇文档"，损害的是"哪一段"。
@@ -176,3 +189,11 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 附加成本：入库慢 10 倍以上（每批 9–20 秒 vs 0.6–1.6 秒），每 10 篇约 90 万 token；批量调用首次失败率高，靠 `context_max_retries=3` 兜住，**调低会静默丢上下文**。
 
 提示词只送文档前 8000 字符（`max_document_prompt_chars`），实测对长文后部块的上下文质量影响很小——模型主要依据 `<chunk>` 自身推断。
+
+### 已知未修：`collection_tags` 建表语句冲突
+
+`engine/mod.rs:211` 建出的表是 `(tag PRIMARY KEY, collection)`，而 `engine/tags.rs:27`
+的建表与写入都假定还有 `chunk_count` 列。`CREATE TABLE IF NOT EXISTS` 让先执行的赢，
+于是标签聚合 SQL 必然失败，表现为每次查询都打一条
+`WARN Tag routing failed: no such column: chunk_count`。功能降级但不崩，
+标签路由（按标签圈定素材范围）实际不可用。修它要改 schema 并涉及已有库迁移。
