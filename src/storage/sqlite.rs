@@ -515,11 +515,43 @@ pub fn search_bm25(
     search_bm25_with_allowed_ids(query, limit, allowed_ids.as_ref())
 }
 
+/// 把用户查询转成 FTS5 安全的 MATCH 表达式。
+///
+/// MATCH 的参数是「表达式」而不是纯文本：`.` `/` `:` `(` `)` `-` 等在 FTS5 里
+/// 都是操作符。原样传入会让 `clippy.toml`、`crates/logic/lib.rs` 这类常见查询
+/// 报 `fts5: syntax error`，并以 HTTP 500 冒泡到调用方。
+///
+/// 规则：
+/// - 词元仅由 [A-Za-z0-9_] 组成（或再带一个尾部 `*`）时原样保留，
+///   以免破坏已有的前缀匹配写法；
+/// - 其余词元用双引号包裹，内部 `"` 按 FTS5 规则翻倍——操作符由此变成普通字符。
+fn fts5_match_expression(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|token| {
+            let stem = token.strip_suffix('*').unwrap_or(token);
+            let plain = !stem.is_empty()
+                && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if plain {
+                token.to_owned()
+            } else {
+                format!("\"{}\"", token.replace('"', "\"\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn search_bm25_with_allowed_ids(
     query: &str,
     limit: usize,
     allowed_ids: Option<&std::collections::HashSet<i64>>,
 ) -> Result<Vec<(i64, f64)>> {
+    let match_expr = fts5_match_expression(query);
+    if match_expr.is_empty() {
+        // 空表达式交给 FTS5 行为未定义，直接判定为关键词通道无结果。
+        return Ok(Vec::new());
+    }
     let conn = get_conn()?;
     let mut candidate_limit = limit.max(1);
 
@@ -532,7 +564,7 @@ fn search_bm25_with_allowed_ids(
              ORDER BY score
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(rusqlite::params![query, candidate_limit as i64], |row| {
+        let rows = stmt.query_map(rusqlite::params![match_expr, candidate_limit as i64], |row| {
             let id: i64 = row.get(0)?;
             let score: f64 = row.get(1)?;
             Ok((id, -score))
@@ -792,6 +824,24 @@ fn get_filtered_chunk_ids_with_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts5_match_expression_quotes_fts_operators() {
+        // 含操作符字符的常见查询必须被引号包裹，否则 FTS5 报 syntax error 并冒泡成 500
+        assert_eq!(fts5_match_expression("clippy.toml"), "\"clippy.toml\"");
+        assert_eq!(
+            fts5_match_expression("crates/logic/lib.rs"),
+            "\"crates/logic/lib.rs\""
+        );
+        assert_eq!(fts5_match_expression("https://a.com/b"), "\"https://a.com/b\"");
+        // 纯标识符与尾部通配保持原样，避免破坏既有前缀匹配能力
+        assert_eq!(fts5_match_expression("on_event"), "on_event");
+        assert_eq!(fts5_match_expression("deploy*"), "deploy*");
+        // 双引号按 FTS5 规则翻倍转义
+        assert_eq!(fts5_match_expression("\"x\""), "\"\"\"x\"\"\"");
+        // 空白输入产出空表达式，调用方据此跳过查询
+        assert!(fts5_match_expression("   ").is_empty());
+    }
 
     #[test]
     fn content_hash_is_stable_sha256() {
