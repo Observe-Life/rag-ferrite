@@ -1,4 +1,5 @@
 use crate::engine::get_conn;
+use crate::storage::fts_text::index_text;
 use crate::types::{ChunkData, SearchFilter, SearchResult, SourceEntry};
 use anyhow::Result;
 
@@ -99,7 +100,7 @@ where
 
     conn.execute(
         "INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)",
-        rusqlite::params![content, chunk_id],
+        rusqlite::params![index_text(content), chunk_id],
     )?;
 
     if conn.query_row(
@@ -349,11 +350,23 @@ pub fn rebuild_fts_index() -> Result<()> {
 
 fn rebuild_fts_index_with_conn(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch("DELETE FROM chunks_fts;")?;
-    conn.execute_batch(
-        "INSERT INTO chunks_fts (content, chunk_id)
-         SELECT content, id FROM chunks WHERE embedding IS NOT NULL;",
-    )?;
-    tracing::info!("FTS5 index rebuilt");
+    // 切词是 Rust 函数，无法在 INSERT ... SELECT 里调用，因此逐行取出正文、
+    // 切词后再写入索引。正文原文仍保留在 chunks 表，供展示与重排使用。
+    let rows: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT content, id FROM chunks WHERE embedding IS NOT NULL",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    {
+        let mut stmt =
+            conn.prepare("INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)")?;
+        for (content, chunk_id) in &rows {
+            stmt.execute(rusqlite::params![index_text(content), chunk_id])?;
+        }
+    }
+    tracing::info!("FTS5 index rebuilt: {} rows tokenized", rows.len());
     Ok(())
 }
 
@@ -362,7 +375,7 @@ pub fn add_to_fts_index(chunk_id: i64, content: &str) -> Result<()> {
     let conn = get_conn()?;
     conn.execute(
         "INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)",
-        rusqlite::params![content, chunk_id],
+        rusqlite::params![index_text(content), chunk_id],
     )?;
     Ok(())
 }
@@ -517,29 +530,23 @@ pub fn search_bm25(
 
 /// 把用户查询转成 FTS5 安全的 MATCH 表达式。
 ///
-/// MATCH 的参数是「表达式」而不是纯文本：`.` `/` `:` `(` `)` `-` 等在 FTS5 里
-/// 都是操作符。原样传入会让 `clippy.toml`、`crates/logic/lib.rs` 这类常见查询
-/// 报 `fts5: syntax error`，并以 HTTP 500 冒泡到调用方。
+/// 两步：先用 [`index_text`] 按与索引侧**完全相同**的规则切词（两侧切法不一致
+/// 会让检索静默失效且不报错），再把词元逐个用双引号包裹并以 `OR` 连接。
 ///
-/// 规则：
-/// - 词元仅由 [A-Za-z0-9_] 组成（或再带一个尾部 `*`）时原样保留，
-///   以免破坏已有的前缀匹配写法；
-/// - 其余词元用双引号包裹，内部 `"` 按 FTS5 规则翻倍——操作符由此变成普通字符。
+/// 引号是必需的：MATCH 的参数是表达式而非文本，`.` `/` `:` 等都是操作符，
+/// 原样传入会让 `clippy.toml` 这类查询报 `fts5: syntax error` 并冒泡成 HTTP 500。
+///
+/// 用 `OR` 而不是 FTS5 默认的 `AND`：中文切词会产出十几个词元，AND 要求全部
+/// 出现，几乎必然零命中；OR 下由 `bm25()` 按命中词元的数量与稀有度自然排序。
+///
+/// 行为变化：用户手写的 `deploy*` 前缀通配与裸 `AND/OR/NOT` 布尔语法不再生效，
+/// 会被当作普通词元。ASCII 词形变化仍由表定义里的 `porter` 词干器覆盖。
 fn fts5_match_expression(query: &str) -> String {
-    query
+    index_text(query)
         .split_whitespace()
-        .map(|token| {
-            let stem = token.strip_suffix('*').unwrap_or(token);
-            let plain = !stem.is_empty()
-                && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if plain {
-                token.to_owned()
-            } else {
-                format!("\"{}\"", token.replace('"', "\"\""))
-            }
-        })
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
 }
 
 fn search_bm25_with_allowed_ids(
@@ -826,19 +833,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fts5_match_expression_quotes_fts_operators() {
-        // 含操作符字符的常见查询必须被引号包裹，否则 FTS5 报 syntax error 并冒泡成 500
-        assert_eq!(fts5_match_expression("clippy.toml"), "\"clippy.toml\"");
-        assert_eq!(
-            fts5_match_expression("crates/logic/lib.rs"),
-            "\"crates/logic/lib.rs\""
-        );
-        assert_eq!(fts5_match_expression("https://a.com/b"), "\"https://a.com/b\"");
-        // 纯标识符与尾部通配保持原样，避免破坏既有前缀匹配能力
-        assert_eq!(fts5_match_expression("on_event"), "on_event");
-        assert_eq!(fts5_match_expression("deploy*"), "deploy*");
-        // 双引号按 FTS5 规则翻倍转义
-        assert_eq!(fts5_match_expression("\"x\""), "\"\"\"x\"\"\"");
+    fn fts5_match_expression_ors_quoted_tokenized_terms() {
+        // 词元逐个加引号，避免 . / 被 FTS5 当作操作符（修复前这类查询直接 500）
+        let e = fts5_match_expression("clippy.toml");
+        assert!(e.contains("\"clippy.toml\""), "{e}");
+        assert!(e.contains(" OR "), "{e}");
+
+        // 中文必须被切成单字与双字，否则 unicode61 会把整句当成一个词
+        let zh = fts5_match_expression("海鲜过敏");
+        assert!(zh.contains("\"海鲜\""), "{zh}");
+        assert!(zh.contains("\"海\""), "{zh}");
+        assert!(zh.contains("\"过敏\""), "{zh}");
+
         // 空白输入产出空表达式，调用方据此跳过查询
         assert!(fts5_match_expression("   ").is_empty());
     }
