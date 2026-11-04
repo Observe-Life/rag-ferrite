@@ -349,7 +349,6 @@ pub fn rebuild_fts_index() -> Result<()> {
 }
 
 fn rebuild_fts_index_with_conn(conn: &rusqlite::Connection) -> Result<()> {
-    conn.execute_batch("DELETE FROM chunks_fts;")?;
     // 切词是 Rust 函数，无法在 INSERT ... SELECT 里调用，因此逐行取出正文、
     // 切词后再写入索引。正文原文仍保留在 chunks 表，供展示与重排使用。
     let rows: Vec<(String, i64)> = {
@@ -358,13 +357,30 @@ fn rebuild_fts_index_with_conn(conn: &rusqlite::Connection) -> Result<()> {
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
+
+    // DELETE 与重插必须整体包在一个事务里，两个原因都是实测踩出来的：
+    //
+    // 1) 性能。逐条 autocommit 插入时，FTS5 每行都要更新倒排 b-tree 并触发 segment
+    //    merge，单次成本随索引已有规模上升，整库重建因此退化成超线性——实测 376 行
+    //    耗时 8 秒，2724 行耗时约 11 分钟。合并成一次提交后回到线性。
+    //    早期实现是单条 INSERT ... SELECT（天然一个隐式事务）；改成逐行切词时丢了
+    //    这层包裹，本改动是补齐，并与项目自身既有范式一致（engine/chunk_heat.rs:96
+    //    已使用 unchecked_transaction）。
+    //
+    // 2) 原子性。DELETE 与重插分处两个隐式事务时，进程中途被杀会留下「索引已清空
+    //    大半」的残缺状态（实测出现过应有 2724 行只剩 866 行），BM25 大面积失效
+    //    且重启无法自愈——因为重建只在有新任务时才跑。
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("DELETE FROM chunks_fts;")?;
     {
         let mut stmt =
-            conn.prepare("INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)")?;
+            tx.prepare("INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)")?;
         for (content, chunk_id) in &rows {
             stmt.execute(rusqlite::params![index_text(content), chunk_id])?;
         }
     }
+    tx.commit()?;
+
     tracing::info!("FTS5 index rebuilt: {} rows tokenized", rows.len());
     Ok(())
 }
