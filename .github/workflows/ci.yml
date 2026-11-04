@@ -2,8 +2,22 @@ name: Rust quality gates
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  # 只改文档时不跑质量关卡：这套关卡要编译整个 workspace 并跑 cargo audit，
+  # 纯文档提交触发它只会产出一条与改动无关的红项（audit 恒红），
+  # 看起来像「文档提交导致构建失败」。
+  # 故意不忽略 .github/workflows/**：改 CI 配置本身必须被验证。
 
 permissions:
   contents: read
