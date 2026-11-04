@@ -1,0 +1,32 @@
+services:
+  rag-ferrite:
+    # 由本仓库 GitHub Actions 构建的 musl 静态二进制 + scratch 镜像
+    image: ghcr.io/observe-life/rag-ferrite:canary
+    container_name: rag-ferrite
+    restart: unless-stopped
+
+    # 配置与数据库都在 /data（工作目录），config.toml 放这里自动加载
+    volumes:
+      - ./data:/data
+
+    # 机内通信走自建 bridge，celld 侧地址：http://rag-ferrite:4242
+    networks:
+      - backend
+
+    # 仅供浏览器访问内置控制台；容器间通信不需要这条
+    ports:
+      - "18081:4242"
+
+    environment:
+      # embedding 的 key 走环境变量（src/embedding.rs:45-46）
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      # 服务鉴权：非 loopback 绑定必须配 key，否则启动即失败
+      # （src/main.rs:455-456，admin=RAG_API_KEY，guest=RAG_GUEST_API_KEY）
+      - RAG_API_KEY=${RAG_API_KEY}
+
+    # scratch 镜像内没有任何 shell/coreutils，因此不能写 exec 健康检查。
+    # 需要健康检查时改用宿主侧探测：curl -f http://rag-ferrite:4242/api/status
+
+networks:
+  backend:
+    external: true

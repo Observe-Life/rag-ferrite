@@ -1,0 +1,114 @@
+name: Build musl binary and image
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: "构建后推送镜像到 GHCR"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-feature=+crt-static"
+  # bundled rusqlite 与 sqlite-vec 要编译 C 代码，musl 目标必须显式指定交叉编译器
+  CC_x86_64_unknown_linux_musl: "musl-gcc"
+  AR_x86_64_unknown_linux_musl: "ar"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools file
+
+      # edition = "2024" 要求 Rust >= 1.85
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: musl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: musl-${{ runner.os }}-
+
+      - name: Build static binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/ragfer ./ragfer
+
+      - name: Verify it is really static
+        run: |
+          file ./ragfer
+          ls -lh ./ragfer
+          if file ./ragfer | grep -q "dynamically linked"; then
+            echo "::error::二进制仍是动态链接，scratch 镜像会起不来"
+            exit 1
+          fi
+          ./ragfer --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ragfer-linux-musl
+          path: ./ragfer
+          retention-days: 14
+
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ragfer-linux-musl
+          path: ./
+
+      - name: Prepare binary
+        run: chmod +x ./ragfer && ls -lh ./ragfer
+
+      - name: Compute image tag
+        id: meta
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          lower=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${lower}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/}"
+            echo "tags=${lower}:latest,${lower}:${v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${lower}:canary" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.push_image || github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: false

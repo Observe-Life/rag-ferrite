@@ -1,0 +1,86 @@
+# rag-ferrite 配置模板
+#
+# 用法：复制到数据目录后改名为 config.toml
+#   cp deploy/config.example.toml /vol1/docker/rag-ferrite/data/config.toml
+#
+# 容器内该文件路径是 /data/config.toml，程序按工作目录自动加载
+# （见 src/config.rs:821-826，WORKDIR 已设为 /data）。
+# 改完重启容器即可生效，不需要重建镜像。
+#
+# 注意：本文件里【不要】写真密钥。embedding 的 key 走环境变量
+# EMBEDDING_API_KEY；只有 reranker.api_key 必须写在这里
+# （src/main.rs:335-338 对 Cohere 重排用 .expect()，没有环境变量回退）。
+
+# ── 存储与端口 ────────────────────────────────────────────────
+data_dir = "/data"
+http_port = 4242
+
+# ── 向量化：外接 OpenAI 兼容 embedding API ────────────────────
+# key 从环境变量 EMBEDDING_API_KEY 读取（src/embedding.rs:45-46，
+# 也接受 OPENAI_API_KEY），不要写在这里。
+[embedding]
+provider = "openai"
+model = "qwen3.7-text-embedding-flash"
+dimensions = 1024
+base_url = "https://www.acctoken.com/v1"
+
+# ── 外接重排 API（Cohere 风格 /v1/rerank）─────────────────────
+# reranker_type 可选 "disabled" | "llm" | "cohere"
+#   （src/config.rs:483-485）
+# base_url 与 provider 实际拼出的请求路径需以一次真实调用为准。
+[reranker]
+reranker_type = "cohere"
+model = "qwen3.7-text-rerank"
+api_key = "在这里填入你的 key"
+base_url = "https://www.acctoken.com/v1"
+top_k = 10
+
+# ── 切片：中文知识库取值 ──────────────────────────────────────
+# 沿用实测结论：块长 300–500 字（中文）、重叠约 20%，
+# 且标题/文件路径作为独立字段加权比调块大小更重要。
+[chunking]
+strategy = "auto"
+parent_max_chars = 2000
+child_max_chars = 500
+child_overlap = 100
+child_min_chars = 100
+auto_threshold = 5000
+
+# ── 服务与网络 ────────────────────────────────────────────────
+[advanced]
+# 默认是 127.0.0.1，容器内必须改 0.0.0.0，否则只有容器自己能访问
+http_bind_address = "0.0.0.0"
+
+# Host 头白名单（Streamable HTTP MCP 的 DNS-rebinding 防护）。
+# 程序会自动追加 bind 地址本身（src/api.rs:547-549），但【不会】自动
+# 追加容器名。celld 用「容器名:端口」访问时 Host 头就是容器名，
+# 所以下面这几项必须显式列出，否则请求会被拒。
+allowed_hosts = [
+  "localhost",
+  "127.0.0.1",
+  "[::1]",
+  "rag-ferrite",
+  "rag-ferrite:4242",
+  "192.168.31.115",
+  "192.168.31.115:18081",
+]
+
+# 非 loopback 绑定 + 无鉴权 = 启动即失败（src/api.rs:513-541）。
+# 保持 false，改用 RAG_API_KEY 环境变量做鉴权，不要图省事打开它。
+unsafe_bind_without_auth = false
+
+# 内置文档库控制台（检索/入库/删除/标签/图谱，不调用大模型生成）。
+# 默认 false，需显式打开：src/api.rs:491
+web_ui_enabled = true
+
+# 允许按路径入库的根目录白名单（容器内路径）
+allowed_ingest_roots = ["/data/library"]
+
+# 入库队列上限，队满返回背压而不是无限囤内存
+ingestion_queue_capacity = 32
+
+# WAL 检查点间隔（0=关闭）。数据在本地 btrfs 块设备上，WAL 安全。
+wal_checkpoint_interval = 50
+
+# 导入后不要移动源文件，保持挂载目录可预测
+move_after_ingest = false
