@@ -745,7 +745,10 @@ fn default_log_file() -> String {
     "rag-ferrite.log".into()
 }
 fn default_log_filter() -> String {
-    "rag_ferrite=debug".into()
+    // 上游原值为 "rag_ferrite=debug"，但本 crate 的真实名字是 ragfer
+    // （Cargo.toml name = "ragfer"）。tracing 的 env-filter 按 target 名匹配，
+    // 名字对不上会把所有日志过滤掉，表现为容器毫无输出、故障只能靠猜。
+    "info".into()
 }
 fn default_http_bind_address() -> String {
     "127.0.0.1".into()

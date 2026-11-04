@@ -25,22 +25,30 @@ dimensions = 1024
 base_url = "https://www.acctoken.com/v1"
 
 # ── 外接重排 API（Cohere 风格 /v1/rerank）─────────────────────
-# reranker_type 可选 "disabled" | "llm" | "cohere"
-#   （src/config.rs:483-485）
-# base_url 与 provider 实际拼出的请求路径需以一次真实调用为准。
+# reranker_type 可选 "disabled" | "llm" | "cohere"（src/config.rs:483-485）
+# cohere 走 HTTP，密钥必须写在下面 api_key 字段——该字段没有环境变量回退
+# （src/main.rs:335-338 用 .expect() 强制要求），所以本文件不要提交进仓库。
 [reranker]
 reranker_type = "cohere"
 model = "qwen3.7-text-rerank"
 api_key = "在这里填入你的 key"
-base_url = "https://www.acctoken.com/v1"
+# 注意：这里的 base_url 是【完整请求地址】，不是前缀（上游默认值即
+# https://api.cohere.ai/v2/rerank）。漏掉 /rerank 会 404。
+# 与之相反，[embedding] 的 base_url 是前缀，程序会自动补 /embeddings。
+base_url = "https://www.acctoken.com/v1/rerank"
 top_k = 10
 
 # ── LLM：本部署显式关闭入库增强 ─────────────────────────────
-# context_enabled 上游默认 true，会在入库时给每个父块调一次大模型生成上下文说明
-# （src/engine/ingest.rs:358 generate_contexts）。本部署只要"切片→向量→混合检索"，
-# 且机器上没有 ollama，默认值会让启动时报 "LLM health check FAILED — ingestion
-# will not work"。关掉后入库不再依赖任何大模型。
+# context_enabled 上游默认 true，入库时会给每个父块调一次大模型生成上下文说明
+# （src/engine/ingest.rs:213、:358）。本部署只要切片、向量化与混合检索，且机器
+# 上没有 ollama，默认值会让启动即报 "LLM health check FAILED — ingestion will
+# not work"。关掉后入库不依赖任何大模型。
+# 若要重新启用：context_enabled 改 true 并填 api_key（该字段无环境变量回退）。
 [llm]
+provider = "openai"
+model = "gemini-3.5-flash-lite"
+api_key = "在这里填入你的 key（保持关闭时可留任意占位）"
+base_url = "https://www.acctoken.com/v1"
 context_enabled = false
 relevance_scoring = false
 
