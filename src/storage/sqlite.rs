@@ -373,8 +373,7 @@ fn rebuild_fts_index_with_conn(conn: &rusqlite::Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch("DELETE FROM chunks_fts;")?;
     {
-        let mut stmt =
-            tx.prepare("INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)")?;
+        let mut stmt = tx.prepare("INSERT INTO chunks_fts (content, chunk_id) VALUES (?1, ?2)")?;
         for (content, chunk_id) in &rows {
             stmt.execute(rusqlite::params![index_text(content), chunk_id])?;
         }
@@ -907,8 +906,16 @@ mod tests {
 
         rebuild_fts_index_with_conn(&conn).unwrap();
 
-        assert_eq!(rows_before, rows(), "全量重建改变了 FTS 行数 → 增量写入有遗漏");
-        assert_eq!(hit_before, hit("章若楠"), "全量重建改变了命中 → 增量与全量不等价");
+        assert_eq!(
+            rows_before,
+            rows(),
+            "全量重建改变了 FTS 行数 → 增量写入有遗漏"
+        );
+        assert_eq!(
+            hit_before,
+            hit("章若楠"),
+            "全量重建改变了命中 → 增量与全量不等价"
+        );
     }
 
     #[test]
