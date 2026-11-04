@@ -1,0 +1,42 @@
+name: Format (manual)
+
+# 仅手动触发：跑 rustfmt 并把结果提交回本分支。
+# 用途是修正「Check formatting」失败——CI 只做校验不改文件，
+# 而 rustfmt 的换行偏好无法可靠地手工推断。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Run rustfmt
+        run: cargo fmt --all
+
+      - name: Show what changed
+        run: |
+          git diff --stat
+          git diff --name-only
+
+      - name: Commit if needed
+        run: |
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "无需改动，代码已符合 rustfmt"
+            exit 0
+          fi
+          git config user.name "Observe-Life"
+          git config user.email "Observe-Life@users.noreply.github.com"
+          git add -A
+          git commit -m "style: 由 rustfmt 统一格式（CI Check formatting 修正）"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+          echo "已提交格式化结果"
