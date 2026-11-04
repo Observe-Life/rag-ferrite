@@ -35,6 +35,15 @@ api_key = "在这里填入你的 key"
 base_url = "https://www.acctoken.com/v1"
 top_k = 10
 
+# ── LLM：本部署显式关闭入库增强 ─────────────────────────────
+# context_enabled 上游默认 true，会在入库时给每个父块调一次大模型生成上下文说明
+# （src/engine/ingest.rs:358 generate_contexts）。本部署只要"切片→向量→混合检索"，
+# 且机器上没有 ollama，默认值会让启动时报 "LLM health check FAILED — ingestion
+# will not work"。关掉后入库不再依赖任何大模型。
+[llm]
+context_enabled = false
+relevance_scoring = false
+
 # ── 切片：中文知识库取值 ──────────────────────────────────────
 # 沿用实测结论：块长 300–500 字（中文）、重叠约 20%，
 # 且标题/文件路径作为独立字段加权比调块大小更重要。
