@@ -127,13 +127,24 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           lower=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
-          echo "image=ghcr.io/${lower}" >> "$GITHUB_OUTPUT"
+          # 标签必须带 ghcr.io/ 前缀。漏掉前缀会让 buildx 以为要推到 Docker Hub，
+          # 拿 GitHub 令牌去 auth.docker.io 认证，报 401 insufficient scopes
+          # ——这正是前五次构建末尾那个"看起来像权限限制"的假象来源。
+          img="ghcr.io/${lower}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             v="${GITHUB_REF#refs/tags/}"
-            echo "tags=${lower}:latest,${lower}:${v}" >> "$GITHUB_OUTPUT"
+            echo "tags=${img}:latest,${img}:${v}" >> "$GITHUB_OUTPUT"
           else
-            echo "tags=${lower}:canary" >> "$GITHUB_OUTPUT"
+            echo "tags=${img}:canary" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Show what will be pushed
+        run: |
+          echo "将推送: ${{ steps.meta.outputs.tags }}"
+          case "${{ steps.meta.outputs.tags }}" in
+            ghcr.io/*) ;;
+            *) echo "::error::标签缺少 ghcr.io/ 前缀，会误推到 Docker Hub"; exit 1 ;;
+          esac
 
       - uses: docker/setup-buildx-action@v3
 
