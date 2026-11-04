@@ -90,7 +90,15 @@ jobs:
             echo "::error::二进制仍是动态链接，scratch 镜像会起不来"
             exit 1
           fi
-          ./ragfer --version
+          # 权威确认：静态二进制不应有任何动态依赖。
+          # 不用 `ragfer --version` 做冒烟测试——该 CLI 不支持这个参数，
+          # 它会打印帮助并以 exit 1 结束（第四次构建就是这么失败的）。
+          # scratch 镜像内没有 shell，运行验证只能在部署后通过 HTTP 健康检查做。
+          ldd ./ragfer 2>&1 | tee /tmp/ldd.txt
+          if ! grep -qE "not a dynamic executable|statically linked" /tmp/ldd.txt; then
+            echo "::error::ldd 显示存在动态依赖，scratch 镜像会缺库"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
