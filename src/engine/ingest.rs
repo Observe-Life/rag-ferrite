@@ -775,7 +775,9 @@ pub(super) fn commit_parent_to_db(
     tx.commit()?;
 
     if parent_tags.iter().any(|(_, t)| !t.is_empty()) {
-        let conn = get_conn()?;
+        // 复用外层已持有的连接 guard。std::sync::Mutex 不可重入，此处若再
+        // get_conn() 会与第 711 行的 guard 形成嵌套取锁并永久阻塞——该分支只在
+        // 上下文增强产出 TAGS 时进入，因此关闭 context_enabled 时不会暴露。
         let _ = update_collection_tags(source_id, &parent_tags, collection_id, &conn);
     }
 
