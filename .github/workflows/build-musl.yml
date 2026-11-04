@@ -53,11 +53,16 @@ jobs:
           restore-keys: musl-${{ runner.os }}-
 
       - name: Generate musl compat shim
+        # __ASSEMBLER__ 保护是必需的：CFLAGS_<target> 按 target 全局生效，
+        # ring crate（rustls 的依赖）会用它编译 .S 汇编文件，若不加保护，
+        # C 的 typedef 会被当成汇编指令解析而报错。
         run: |
           {
             echo '#ifndef RAGFER_MUSL_U8_SHIM_H'
             echo '#define RAGFER_MUSL_U8_SHIM_H'
+            echo '#ifndef __ASSEMBLER__'
             echo 'typedef unsigned char u8;'
+            echo '#endif'
             echo '#endif'
           } > /tmp/musl-u8-shim.h
           cat /tmp/musl-u8-shim.h
