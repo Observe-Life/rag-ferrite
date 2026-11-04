@@ -46,7 +46,8 @@ top_k = 10
 # 若要重新启用：context_enabled 改 true 并填 api_key（该字段无环境变量回退）。
 [llm]
 provider = "openai"
-model = "gemini-3.5-flash-lite"
+# qwen3.7-flash 为实测验证过的取值（健康检查通过、生成的上下文对长文后部块仍准确）
+model = "qwen3.7-flash"
 api_key = "在这里填入你的 key（保持关闭时可留任意占位）"
 base_url = "https://www.acctoken.com/v1"
 context_enabled = false

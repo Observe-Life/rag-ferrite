@@ -118,7 +118,7 @@ cp deploy/config.example.toml /vol1/docker/rag-ferrite/data/config.toml
 | `web_ui_enabled` | `true` | 默认 `false`，内置控制台不开放 |
 | `reranker.base_url` | 完整地址 `.../v1/rerank` | 这是**完整 URL 不是前缀**，漏 `/rerank` 会 404 |
 | `embedding.base_url` | 前缀 `.../v1` | 与上面相反，程序自动补 `/embeddings` |
-| `llm.context_enabled` | `false` | 上游默认 `true`，入库时每个父块调一次大模型；无可用 LLM 会报 `ingestion will not work` |
+| `llm.context_enabled` | `false` | 上游默认 `true`，入库时每个父块调一次大模型；无可用 LLM 会报 `ingestion will not work`。**另注意：`bc80ba8` 之前的镜像开启此项会导致入库 100% 死锁**（见下方改动表） |
 
 ### 3. 验证清单
 
@@ -138,14 +138,15 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 
 ---
 
-## 本仓库相对上游的四项改动
+## 本仓库相对上游的五项改动
 
 | 提交 | 内容 | 为什么 |
 |---|---|---|
 | `a1432ea` | 消除混合检索与关键词检索的**嵌套取锁死锁** | 全进程只有一个 SQLite 连接由 `std::sync::Mutex` 保护，而该锁不可重入；`search_hybrid` 外层持锁后又调用内层取锁的子函数，请求永久挂起。修法采用项目自身已有的块作用域范式 |
 | `ba10e38` | **FTS5 MATCH 表达式转义** | `.` `/` 在 FTS5 里是操作符，`clippy.toml`、`crates/logic/lib.rs` 这类查询会报语法错误并冒泡成 HTTP 500 |
 | `fd71320` | **中文切词**（`src/storage/fts_text.rs`） | FTS5 的 `unicode61` 把连续汉字当成一个词，中文关键词检索必然落空。规则：汉字段出单字+相邻双字；ASCII 段整词小写并保留 `- _ . / +`；中英紧邻补跨界词；标点断开。索引侧与查询侧共用同一函数 |
-| 本次 | `default_log_filter()` 由 `rag_ferrite=debug` 改为 `info` | crate 真名是 `ragfer`，名字不匹配导致所有日志被过滤，容器表现为毫无输出 |
+| `4359a2d` | `default_log_filter()` 由 `rag_ferrite=debug` 改为 `info` | crate 真名是 `ragfer`，名字不匹配导致所有日志被过滤，容器表现为毫无输出 |
+| `bc80ba8` | 消除**入库路径**的嵌套取锁死锁 | `commit_parent_to_db` 的 guard 作用域直到函数末尾，而标签分支里又二次 `get_conn()`。该分支只在上下文增强产出 TAGS 时进入，因此关闭 `context_enabled` 时永不触发——这是它长期未被发现的原因。实测开启后入库 100% 卡死：18 线程全停在 `futex_wait`、无一停在 `epoll_wait`、无对外连接 |
 
 切词只作用于全文索引表 `chunks_fts`；`chunks.content` 保持原文，因此重排模型和大模型读到的仍是干净文本。代价是 OR 连接使召回变宽，精度依赖 `bm25()` 打分、RRF 与重排收敛。
 
@@ -155,10 +156,23 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 
 | 指标 | 数值 |
 |---|---|
-| 常驻内存 | **3.59 MiB**（CPU 0%） |
+| 常驻内存 | 2.6–3.6 MiB（随运行时长浮动，CPU 0%） |
 | 库文件 | 8.6 MB + WAL 0.9 MB |
 | 单查询耗时 | 0.17–0.79 秒 |
 | Hit@3 | 13/13 |
 | Hit@1 | 无重排 12/13；有重排 11/13 |
 
-失败集中在**主题相近的文档互相混淆**（如《MSP简介》与《MSP前景分析》），根因是被向量化的文本不含出处信息（`section_path` 只作为元数据存列，见 `src/engine/ingest.rs:279`）。开启 `llm.context_enabled` 可缓解，属可选优化。
+失败集中在**主题相近的文档互相混淆**（如《MSP简介》与《MSP前景分析》）。核查后修正：两篇各自都含定义式表述，属文档内容本身交叉，不是索引能区分的问题，该条不应判错。
+
+**上下文增强（`llm.context_enabled`）已实测否决，保持关闭。**
+
+| 层面 | 关闭 | 开启 |
+|---|---|---|
+| 文档级 Hit@1 | 12/13 | 12/13（名次零变化，失败点相同） |
+| 块级 MRR（10 条 gold，宽松口径） | **0.867** | 0.803 |
+
+机制：上下文前缀对同一文档的所有块近似，把组内相似度从 0.4801 抬到 0.5091，代价是**抹平块与块的差异**——精确细节类查询里正确块的绝对相似度反而下降（0.5436→0.4746），与相邻块的差距从 0.048 缩到 0.001。检索最终按块返回，故净效果为负。它优化的是"哪篇文档"，损害的是"哪一段"。
+
+附加成本：入库慢 10 倍以上（每批 9–20 秒 vs 0.6–1.6 秒），每 10 篇约 90 万 token；批量调用首次失败率高，靠 `context_max_retries=3` 兜住，**调低会静默丢上下文**。
+
+提示词只送文档前 8000 字符（`max_document_prompt_chars`），实测对长文后部块的上下文质量影响很小——模型主要依据 `<chunk>` 自身推断。
