@@ -21,6 +21,11 @@ env:
   # bundled rusqlite 与 sqlite-vec 要编译 C 代码，musl 目标必须显式指定交叉编译器
   CC_x86_64_unknown_linux_musl: "musl-gcc"
   AR_x86_64_unknown_linux_musl: "ar"
+  # sqlite-vec.c 依赖 glibc <sys/types.h> 里的历史 typedef `u8`（unsigned char），
+  # musl 不提供该定义，编译器会退化成 int，导致指针宽度不匹配。
+  # 这里用 -include 注入一个 shim 头补上定义，而不是用 -Wno-incompatible-pointer-types
+  # 压掉警告——压掉警告会让 bitmap 按错误位宽索引内存，变成运行时数据损坏。
+  CFLAGS_x86_64_unknown_linux_musl: "-include /tmp/musl-u8-shim.h"
 
 jobs:
   build:
@@ -46,6 +51,16 @@ jobs:
             target
           key: musl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: musl-${{ runner.os }}-
+
+      - name: Generate musl compat shim
+        run: |
+          {
+            echo '#ifndef RAGFER_MUSL_U8_SHIM_H'
+            echo '#define RAGFER_MUSL_U8_SHIM_H'
+            echo 'typedef unsigned char u8;'
+            echo '#endif'
+          } > /tmp/musl-u8-shim.h
+          cat /tmp/musl-u8-shim.h
 
       - name: Build static binary
         run: |
