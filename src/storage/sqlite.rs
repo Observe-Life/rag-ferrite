@@ -505,8 +505,13 @@ pub fn search_bm25(
     limit: usize,
     filter: Option<&SearchFilter>,
 ) -> Result<Vec<(i64, f64)>> {
-    let conn = get_conn()?;
-    let allowed_ids = filtered_ids_for_filter(&conn, filter)?;
+    // 锁只在一层持有：guard 收进块内，在调用会自行取锁的子函数之前释放。
+    // std::sync::Mutex 不可重入，外层持锁再调子函数会永久死锁。
+    // 本范式与 src/engine/ingest.rs 中已有的写法一致。
+    let allowed_ids = {
+        let conn = get_conn()?;
+        filtered_ids_for_filter(&conn, filter)?
+    };
     search_bm25_with_allowed_ids(query, limit, allowed_ids.as_ref())
 }
 
@@ -565,8 +570,13 @@ pub fn search_hybrid(
 
     // 1. Resolve the relational filter once and share it between retrieval paths.
     // This avoids materializing the same potentially large ID set twice.
-    let conn = get_conn()?;
-    let allowed_ids = filtered_ids_for_filter(&conn, filter.as_ref())?;
+    //
+    // guard 必须收进块内：下面两个子函数内部各自取锁，而
+    // std::sync::Mutex 不可重入，外层持锁会让它们永久阻塞。
+    let allowed_ids = {
+        let conn = get_conn()?;
+        filtered_ids_for_filter(&conn, filter.as_ref())?
+    };
     let vector_results = search_vector_with_allowed_ids(
         &query_embedding,
         candidate_k,
