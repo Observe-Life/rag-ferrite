@@ -53,15 +53,25 @@ jobs:
           restore-keys: musl-${{ runner.os }}-
 
       - name: Generate musl compat shim
+        # sqlite-vec.c 使用 BSD 风格类型别名 u_int8_t/u_int16_t/u_int32_t/u_int64_t，
+        # musl 的 <sys/types.h> 只在 _BSD_SOURCE 或 _GNU_SOURCE 下暴露这些别名，
+        # 而 glibc 无条件暴露（上游 CI 只在 ubuntu/glibc 跑，所以从未触发）。
+        #
+        # 这里只打开 _BSD_SOURCE 并提前引入 <sys/types.h>，让 musl 用它自己的定义，
+        # 类型宽度必然与调用处一致。不要自己 typedef 补 u8：sqlite-vec.c:77 已经
+        # 自行 `typedef uint8_t u8;`，重复定义会直接冲突（上一版就是这么失败的）。
+        #
         # __ASSEMBLER__ 保护是必需的：CFLAGS_<target> 按 target 全局生效，
-        # ring crate（rustls 的依赖）会用它编译 .S 汇编文件，若不加保护，
-        # C 的 typedef 会被当成汇编指令解析而报错。
+        # ring crate 会用它编译 .S 汇编，C 代码会被当成汇编指令解析而报错。
         run: |
           {
-            echo '#ifndef RAGFER_MUSL_U8_SHIM_H'
-            echo '#define RAGFER_MUSL_U8_SHIM_H'
+            echo '#ifndef RAGFER_MUSL_BSD_TYPES_SHIM_H'
+            echo '#define RAGFER_MUSL_BSD_TYPES_SHIM_H'
             echo '#ifndef __ASSEMBLER__'
-            echo 'typedef unsigned char u8;'
+            echo '#ifndef _BSD_SOURCE'
+            echo '#define _BSD_SOURCE'
+            echo '#endif'
+            echo '#include <sys/types.h>'
             echo '#endif'
             echo '#endif'
           } > /tmp/musl-u8-shim.h
