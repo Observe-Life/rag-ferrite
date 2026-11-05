@@ -95,16 +95,50 @@ pub enum QueryComplexity {
     Complex,
 }
 
+/// 查询的「语义单元数」，口径与 [`crate::storage::fts_text::index_text`] 的切词一致。
+///
+/// 纯 ASCII 词按空白计数（与上游原行为逐字相同）；含汉字的段按相邻双字计数
+/// （向上取整），段内夹的 ASCII 子串各算一个单元。汉字判定复用
+/// [`crate::storage::fts_text::is_ideograph`]，不另立定义。
+///
+/// 为什么必须有这个函数（2026-11-05 实测）：`split_whitespace().count()` 对中文
+/// 整句恒等于 1，而 `simple_word_threshold` 默认 2 —— 于是**任何中文查询都被判成
+/// Simple**，Simple 路径不重排、也不受 `reranker.top_k` 截断。实测：带空格的查询
+/// 返回 10 条且每条带 `rerank_score`（0.99），纯中文整句返回满 limit 条且
+/// `rerank_score` 全空，容器日志直接印 `complexity=Simple`。分类器对中文整体失效。
+pub fn term_count(query: &str) -> usize {
+    query
+        .split_whitespace()
+        .map(|token| {
+            let cjk = token
+                .chars()
+                .filter(|c| crate::storage::fts_text::is_ideograph(*c))
+                .count();
+            if cjk == 0 {
+                return 1;
+            }
+            let ascii_runs = token
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .count();
+            cjk.div_ceil(2) + ascii_runs
+        })
+        .sum()
+}
+
 /// Classify a query into Simple / Standard / Complex.
 ///
-/// Rules:
-/// - **Simple**: 1–2 words, no question markers, no boolean operators.
-/// - **Complex**: >8 words **OR** contains question markers **OR** contains
+/// Rules（计数单位是 [`term_count`] 的语义单元，不是空白分隔的词数）:
+/// - **Simple**: 1–2 units, no question markers, no boolean operators.
+/// - **Complex**: >8 units **OR** contains question markers **OR** contains
 ///   boolean operators (AND / OR / et / ou).
-/// - **Standard**: everything else (3–8 words, no question/boolean signals).
+/// - **Standard**: everything else (3–8 units, no question/boolean signals).
+///
+/// 本部署 LLM 关闭时，Complex 与 Standard 的实际差别只剩"是否重排"之外都相同
+/// （扩展与改写重试都需要 LLM），所以长中文问句进 Complex 不会引入额外调用。
 pub fn classify_query(query: &str, cfg: &QueryClassificationConfig) -> QueryComplexity {
     let words: Vec<&str> = query.split_whitespace().collect();
-    let word_count = words.len();
+    let word_count = term_count(query);
 
     let has_question_marker = words.iter().any(|w| {
         let trimmed =
@@ -279,7 +313,7 @@ impl QueryPipeline {
         filter: Option<crate::types::SearchFilter>,
         complexity: QueryComplexity,
     ) -> Result<QueryOutput> {
-        let word_count = query.split_whitespace().count();
+        let word_count = term_count(query);
 
         // Use expansion for short queries
         let results = if word_count <= EXPANSION_WORD_THRESHOLD {
@@ -403,6 +437,34 @@ mod tests {
 
     fn default_cfg() -> QueryClassificationConfig {
         QueryClassificationConfig::default()
+    }
+
+    #[test]
+    fn cjk_sentence_is_not_simple() {
+        let cfg = default_cfg();
+        // 中文整句按空白数词=1，会被判 Simple 并跳过重排（2026-11-05 实测缺陷）
+        assert_eq!(term_count("我对什么食物过敏"), 4);
+        assert_eq!(
+            classify_query("我对什么食物过敏", &cfg),
+            QueryComplexity::Standard
+        );
+        // 单个中文词仍应是 Simple
+        assert_eq!(classify_query("海鲜", &cfg), QueryComplexity::Simple);
+        // 中英混排：汉字段按双字计，段内 ASCII 各算一个
+        assert_eq!(term_count("celld容器内存上限"), 4);
+        // 长中文问句进 Complex（LLM 关闭时不产生额外调用）
+        let long = "容器内存为什么又涨到两百多兆了请完整阅读仓库源码查明根因不要动容器";
+        assert!(term_count(long) > 8, "长中文句应超过 Complex 阈值");
+        assert_eq!(classify_query(long, &cfg), QueryComplexity::Complex);
+    }
+
+    #[test]
+    fn ascii_unit_count_is_unchanged() {
+        // 回归护栏：纯 ASCII 的单元数必须等于空白词数，上游行为逐字不变
+        assert_eq!(term_count("search my documents for rust"), 5);
+        assert_eq!(term_count("one two three four five six seven eight nine"), 9);
+        assert_eq!(term_count(""), 0);
+        assert_eq!(term_count("pourquoi ça marche"), 3);
     }
 
     #[test]

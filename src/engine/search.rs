@@ -65,7 +65,8 @@ pub async fn search_hybrid_with_expansion(
 
     // ── 3. Expand short queries ──
     let queries = if let Some(llm_provider) = llm {
-        let word_count = query.split_whitespace().count();
+        // 与分类器同一口径：中文整句按空白数词恒为 1，会让"短查询"判断失真
+        let word_count = crate::pipeline::term_count(query);
         if word_count <= crate::pipeline::EXPANSION_WORD_THRESHOLD {
             match llm_provider.expand_query(query).await {
                 Ok(expansions) => {

@@ -47,6 +47,15 @@ fn class_of(c: char) -> Option<Class> {
     }
 }
 
+/// 汉字（及假名/谚文/扩展区）码位判定。
+///
+/// 这是本仓库**唯一**的"什么算汉字"定义点：索引侧、查询侧、以及
+/// `pipeline::term_count` 的单元计数都必须走这里，否则两处口径一漂移，
+/// 分类器与实际切词就会脱节（中文 BM25 最常见的静默失效形态）。
+pub fn is_ideograph(c: char) -> bool {
+    class_of(c) == Some(Class::Ideograph)
+}
+
 #[derive(Debug)]
 struct Seg {
     kind: Class,
