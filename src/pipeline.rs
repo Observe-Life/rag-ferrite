@@ -462,7 +462,10 @@ mod tests {
     fn ascii_unit_count_is_unchanged() {
         // 回归护栏：纯 ASCII 的单元数必须等于空白词数，上游行为逐字不变
         assert_eq!(term_count("search my documents for rust"), 5);
-        assert_eq!(term_count("one two three four five six seven eight nine"), 9);
+        assert_eq!(
+            term_count("one two three four five six seven eight nine"),
+            9
+        );
         assert_eq!(term_count(""), 0);
         assert_eq!(term_count("pourquoi ça marche"), 3);
     }
