@@ -8,7 +8,7 @@
 - 二、镜像构建
   - （一）构建方式与产物形态
   - （二）工作流清单
-  - （三）五条必须知道的构建约束
+  - （三）三条必须知道的构建约束
 - 三、容器部署
   - （一）目录结构
   - （二）compose 要点
@@ -22,11 +22,11 @@
   - （一）查询与状态
   - （二）入库必须用批量端点
   - （三）返回条数受 `reranker.top_k` 截断
-  - （四）结果缓存会绕过重排
+  - （四）中文整句曾跳过重排（已修复）
   - （五）上下文增强已实测否决，保持关闭
   - （六）实测基线
 - 六、源码修改
-  - （一）本仓库相对上游的七项改动
+  - （一）本仓库相对上游的八项改动
   - （二）切词的作用范围与代价
   - （三）索引一致性的正确口径
 - 七、已知缺陷
@@ -49,13 +49,6 @@
 3. 混合检索：多路结果融合算法（RRF）、重排（云端API）
 4. 切块文本、倒排索引、向量的存储数据库：SQLite
 
-| 位置 | 内容 |
-|---|---|
-| 镜像 | `ghcr.io/observe-life/rag-ferrite:canary`（约 21.6 MB） |
-| 部署目录 | `/vol1/docker/rag-ferrite/` |
-| 机内地址 | `http://rag-ferrite:4242` |
-| 浏览器地址 | `http://<服务器IP>:18081` |
-
 ---
 
 ## 二、镜像构建
@@ -66,6 +59,8 @@
 
 构建产物是 `FROM scratch` + 一个静态二进制，没有 libc 依赖：`rusqlite` 用 `bundled`（SQLite 源码编进二进制）、`sqlite-vec` 静态链接、TLS 根证书由 `webpki-roots` 内嵌，所以镜像里不需要 `/etc/ssl`。
 
+产物推送到 `ghcr.io/observe-life/rag-ferrite:canary`，镜像约 21.6 MB。
+
 ### （二）工作流清单
 
 | 工作流 | 触发 | 作用 |
@@ -74,7 +69,7 @@
 | `fmt.yml` | 仅手动 | 跑 `cargo fmt --all` 并自动提交结果 |
 | `ci.yml`（上游） | push / PR | 格式、clippy、测试、依赖审计 |
 
-### （三）五条必须知道的构建约束
+### （三）三条必须知道的构建约束
 
 1. **镜像构建只认手动触发和 `v*` 标签**。`build-musl.yml` 的触发器是 `workflow_dispatch` + `push:tags:v*`，普通 push 到 main 不会构建镜像；历次运行 `event` 均为 `workflow_dispatch` 可佐证。而 `ci.yml`（Rust quality gates）对每次 push 到 main 都跑，已配置 `paths-ignore` 排除 `**.md`、`docs/**`、`LICENSE`、`.gitignore`，但**不排除** `.github/workflows/**`——改 CI 配置本身必须被验证。
 
@@ -189,6 +184,8 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 
 查询走 `POST /api/query`，带 `Authorization: Bearer <RAG_API_KEY>`。全新查询实测 0.67–0.71 秒（含重排）。
 
+两种访问地址：**容器之间**用 `http://rag-ferrite:4242`（容器名:机内端口，不需要端口映射）；**浏览器和宿主机**用 `http://<服务器IP>:18081`。
+
 ### （二）入库必须用批量端点，不要用逐篇 `/api/ingest/data`
 
 `/api/ingest` 接受 `{"paths":[...]}`，走 `IngestJob::Batch`，**整批只做一次索引 flush**；而逐篇 `/api/ingest/data` 每篇都会触发一次 flush。文件须位于 `allowed_ingest_roots`（本机为 `/data/library`）之下。内容按 SHA-256 判重，重复提交会被跳过（回执里 `0 chunks`），所以重跑同一批是安全的。
@@ -199,11 +196,15 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 
 `top_k = 10` 时，即使请求 `limit=20`，全新查询也只返回 10 条。要拿更多重排结果，必须同时调大 `reranker.top_k`，不能只调 `limit`。
 
-### （四）结果缓存会绕过重排
+### （四）中文整句曾跳过重排（已修复）
 
-同一句查询重复执行会命中 pipeline 结果缓存，耗时从 0.7 秒骤降到 0.01 秒，且**缓存条目里存的是未经重排的结果**：实测重复查询 `limit=20` 返回 20 条但 `rerank_score` 全为空，而全新查询 `limit=20` 返回 10 条且每条都带 `rerank_score`。
+`classify_query` 用 `split_whitespace().count()` 数词，中文整句没有空格恒等于 1，于是被 `simple_word_threshold = 2` 判成 Simple 路径——Simple **不重排、也不受 `reranker.top_k` 截断**。实测（`limit=20`，加一次性 nonce 保证全新）：带空格的查询返回 10 条且每条带 `rerank_score`（最高 0.99），纯中文整句返回满 20 条且 `rerank_score` 全空，容器日志直接印 `complexity=Simple`。
 
-**做检索质量评测必须用全新查询**（句子里加一次性 nonce 即可），否则不同轮次测的根本不是同一条代码路径，结果不可比。
+曾据这个现象误判为"结果缓存会绕过重排"。**真因不是缓存**：同一句查询重复执行命中缓存，返回的正是同一份**已重排**结果（实测带分、0.01 秒）。当时看到"重复查询返回 20 条无分"，是因为那句查询本身就走的 Simple。
+
+已由 `01f9c66` 修复（分类改按语义单元计数，见六（一））。修复后 6 条中文查询全部走重排。
+
+**做检索质量评测仍必须用全新查询**（句子里加一次性 nonce 即可），否则不同轮次命中的是缓存里的同一份结果，不可比。
 
 ### （五）上下文增强（`llm.context_enabled`）已实测否决，保持关闭
 
@@ -242,7 +243,7 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 
 ## 六、源码修改
 
-### （一）本仓库相对上游的七项改动
+### （一）本仓库相对上游的八项改动
 
 | 提交 | 内容 | 为什么 |
 |---|---|---|
@@ -252,6 +253,7 @@ Q() { curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: ap
 | `4359a2d` | `default_log_filter()` 由 `rag_ferrite=debug` 改为 `info` | crate 真名是 `ragfer`，名字不匹配导致所有日志被过滤，容器表现为毫无输出 |
 | `bc80ba8` | 消除**入库路径**的嵌套取锁死锁 | `commit_parent_to_db` 的 guard 作用域直到函数末尾，而标签分支里又二次 `get_conn()`。该分支只在上下文增强产出 TAGS 时进入，因此关闭 `context_enabled` 时永不触发——这是它长期未被发现的原因。实测开启后入库 100% 卡死：18 线程全停在 `futex_wait`、无一停在 `epoll_wait`、无对外连接 |
 | `4137990` | 队列层不再对**单篇任务**无条件全量重建索引 | `ingestion.rs` 的 `IngestJob::File`/`Data` 分支在每个任务后都调 `rebuild_indexes_serialized()`，**完全绕过 `defer_index_rebuild`（默认已是 `true`）**。于是每篇一次全库重建，逐篇导入累计成本 O(n²)，且重建持有全局单连接锁、期间所有 API 无响应。改为尊重该配置；`Batch` 分支与显式 flush 保留（那才是 `flush_indexes()` 注释声明的意图） |
+| `01f9c66` | 查询分类改按**语义单元**计数（`pipeline::term_count`） | `classify_query` 原用 `split_whitespace().count()` 数词，中文整句没有空格恒等于 1，被 `simple_word_threshold = 2` 判成 Simple 路径，而 Simple **不重排、也不受 `reranker.top_k` 截断**——等于所有中文查询都没有重排。新口径：ASCII 仍按空白计数，含汉字的段按相邻双字向上取整，段内 ASCII 子串各计一个；汉字判定复用 `fts_text::is_ideograph`，与切词共用同一套定义。实测：修复前 6 条中文查询一律返回满 20 条且 `rerank_score` 全空；修复后一律返回 10 条且每条带分（0.63~0.9995），单查询多约 0.3~0.6 秒。详见五（四） |
 | `32aac94` | 索引重建整体包进**一个事务** | 逐行 `stmt.execute()` 在 WAL 下每行一个隐式事务，而 FTS5 每次插入都要更新倒排 b-tree 并 segment merge，成本随索引规模上升——实测 2724 行重建约 660 秒。事务化后 5652 行只用 5.0 秒。同一事务还保证 DELETE 与重插原子：此前进程被杀会留下「索引已清空大半」的残缺状态且重启不自愈 |
 
 ### （二）切词的作用范围与代价
@@ -284,4 +286,4 @@ SELECT COUNT(*) FROM chunks_fts;                              -- 实际
 命中 32 条安全公告，原因是 fork 基线停在 2026-10-07，上游此后已 bump rmcp/tokio/toml/ratatui。与本仓库改动无关（未引入任何依赖）。
 
 ---
-*最后更新：2026-11-05。*
+*最后更新：2026-11-06。*
