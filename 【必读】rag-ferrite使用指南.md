@@ -43,9 +43,11 @@
 
 ### （二）术语定义与一些规范
 
-派生自 [lelabdev/rag-ferrite](https://github.com/lelabdev/rag-ferrite)（MIT），基线 commit `c54ec42`（2026-10-07，v5.3.0）。本仓库在其之上有 **25 次提交**，其中实质性源码改动 7 项（见六（一）），其余为文档、CI 与格式。
-
-功能范围只取四件事：**切片、向量化、混合检索、SQLite 存储**。不用的能力（入库期大模型增强、标签路由）一律显式关闭，理由见五（五）与七（一）。
+本RAG软件采用的混合检索方案：
+1. 关键词检索：分词（双字滑窗、单字兜底的中、英文分词算法，入库生成倒排索引和检索时调用）、生成倒排索引（FTS5）、关键词检索（FTS5）、检索相关性打分（FTS5内置的BM25）
+2. 语义检索：生成向量（云端API，为入库文本和搜索词句生成向量）、检索向量（KNN，用搜索词句的向量检索库存的向量）
+3. 混合检索：多路结果融合算法（RRF）、重排（云端API）
+4. 切块文本、倒排索引、向量的存储数据库：SQLite
 
 | 位置 | 内容 |
 |---|---|
@@ -79,17 +81,6 @@
 2. **镜像标签必须带 `ghcr.io/` 前缀**。漏掉前缀 buildx 会当成 Docker Hub 处理，拿 GitHub 令牌去 `auth.docker.io` 认证，报 `401 insufficient scopes`——看起来像权限问题，实际是笔误。工作流里已加自检，标签不含前缀直接失败。
 
 3. **musl 需要显式指定交叉编译器**。`CC_x86_64_unknown_linux_musl=musl-gcc`，因为 `rusqlite` 的 bundled 与 `sqlite-vec` 都要编 C。
-
-4. **Actions 自己推送的提交不会再触发工作流**（GitHub 防递归）。所以 `fmt.yml` 提交的格式化结果需要**补一个空提交**才能进 CI。
-
-5. **GitHub 事故期间状态字段会滞后**。同一 job 可能同时显示 `completed/failure` 和 `queued/in progress`，日志也读不到。判断构建是否成功，**用拉取镜像比对 digest，不要信 `run list`**：
-
-   ```bash
-   OLD=$(docker inspect --format '{{.Id}}' ghcr.io/observe-life/rag-ferrite:canary)
-   docker pull ghcr.io/observe-life/rag-ferrite:canary
-   [ "$(docker inspect --format '{{.Id}}' ghcr.io/observe-life/rag-ferrite:canary)" != "$OLD" ] \
-     && echo "新镜像已产出"
-   ```
 
 ---
 
